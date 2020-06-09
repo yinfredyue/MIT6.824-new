@@ -38,6 +38,17 @@ down an instance. You can check whether Kill() has been called using
 rf.killed(). You may want to do this in all loops, to avoid having dead Raft
 instances print confusing messages.
 
+Lab 2B
+- [ ] Your first goal should be to pass TestBasicAgree2B(). Start by
+implementing Start(), then write the code to send and receive new log entries
+via AppendEntries RPCs, following Figure 2.
+- [ ] You will need to implement the election restriction (section 5.4.1).
+= [ ] One way to fail to reach agreement in the early Lab 2B tests is to hold
+repeated elections even though the leader is alive. Look for bugs in election
+timer management, or not sending out heartbeats immediately after winning an
+election.
+- [ ] Avoid loops that repeatedly check for evnets. Use conditional variable or
+sleeps to avoid such loops.
 */
 
 //
@@ -137,6 +148,8 @@ type Raft struct {
 	heartbeatInterval          time.Duration
 	electionTimerCheckInterval time.Duration
 	heartbeatCheckInterval     time.Duration
+
+	applyCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -201,13 +214,18 @@ func (rf *Raft) readPersist(data []byte) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
 
-	return index, term, isLeader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.state != leaderState {
+		return -1, -1, false
+	}
+
+	// Start the agreement process and return immediately
+	rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
+	return len(rf.log) - 1, rf.currentTerm, true
 }
 
 //
@@ -230,6 +248,8 @@ func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
 }
+
+/////////////////////// RequestVote (start) //////////////////////
 
 //
 // example RequestVote RPC arguments structure.
@@ -394,15 +414,18 @@ func (rf *Raft) sendRequestVoteAndHandleReply(args RequestVoteArgs, server int) 
 			}
 
 			// Send initial heartbeats to peers in parallel
-			DPrintf("[%v] tries to send heartbeats to peers", rf.me)
-			rf.sendHeartbeats()
+			DPrintf("[%v] immediately sends heartbeats to peers", rf.me)
+			rf.sendAppendEntriesToPeers()
 
-			// Create routine for sending heartbeat when idle
-			DPrintf("[%v] as leader creates thread for periodic heartbeat", rf.me)
-			go rf.periodicHeartbeatRoutine()
+			// Create routine for sending periodic AppendEntries
+			go rf.periodicAppendEntriesRoutine()
 		}
 	}
 }
+
+/////////////////////// RequestVote (end) //////////////////////
+
+/////////////////////// AppendEntries (start) //////////////////////
 
 type AppendEntriesArgs struct {
 	Term         int
@@ -453,6 +476,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = true
 
+	// Mentioned in "The importance of details" section of the student guide.
+	// Mustn't truncate rf.log after args.PrevLogIndex, but should delete entry
+	// only if conflict happens.
 	// rf.log matches the log of the leader at index args.PrevLogIndex
 	// Overwrite args.Entries into rf.log
 	for i := 0; i < len(args.Entries); i++ {
@@ -464,7 +490,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 }
 
-func (rf *Raft) periodicHeartbeatRoutine() {
+func (rf *Raft) periodicAppendEntriesRoutine() {
 	for {
 		rf.mu.Lock()
 		if rf.state != leaderState {
@@ -479,15 +505,18 @@ func (rf *Raft) periodicHeartbeatRoutine() {
 		}
 
 		// HeartbeatInterval reached
-		DPrintf("[%v] tries to send periodic heartbeats to peers", rf.me)
-		rf.sendHeartbeats()
+		DPrintf("[%v] tries to send periodic AppendEntries to peers", rf.me)
+		rf.sendAppendEntriesToPeers()
+		rf.prevAppendEntries = time.Now()
+
 		rf.mu.Unlock()
 	}
 }
 
-// sendHeartbeats sends heartbeat (empty AppendEntries RPC) to all peers.
-// It requires the caller holding rf.mu throughout the call.
-func (rf *Raft) sendHeartbeats() {
+// sendAppendEntriesToPeers sends heartbeat (empty AppendEntries RPC) to all
+// peers. It requires the caller holding rf.mu throughout the call.
+func (rf *Raft) sendAppendEntriesToPeers() {
+	// TODO: currently only sending heartbeats
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -519,6 +548,8 @@ func (rf *Raft) sendHeartbeats() {
 	}
 }
 
+/////////////////////// AppendEntries (end) //////////////////////
+
 // resetElectionTimer resets the election timer and generates a new random
 // election timeout. It requires the caller holding rf.mu throughout the call.
 func (rf *Raft) resetElectionTimer() {
@@ -539,6 +570,32 @@ func (rf *Raft) convertToFollowerIfOutOfTerm(rpcTerm int) bool {
 	}
 
 	return false
+}
+
+func (rf *Raft) applyCommittedRoutine() {
+	// Later change this to use condition variable
+	for {
+		toApply := false
+		var applyMsg ApplyMsg
+
+		rf.mu.Lock()
+		if rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			applyMsg = ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied],
+				CommandIndex: rf.lastApplied,
+			}
+			toApply = true
+		}
+		rf.mu.Unlock()
+
+		if toApply {
+			rf.applyCh <- applyMsg
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 //
@@ -578,6 +635,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatInterval = 200 * time.Millisecond
 	rf.electionTimerCheckInterval = 150 * time.Millisecond
 	rf.heartbeatCheckInterval = 50 * time.Millisecond
+	rf.applyCh = applyCh
 
 	// Leader only fields would be initialized later when elected
 
@@ -586,6 +644,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Start goroutines for periodic tasks
 	go rf.electionTimoutRoutine()
+	go rf.applyCommittedRoutine()
 
 	DPrintf("[%v] Starts off", rf.me)
 	return rf

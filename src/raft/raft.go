@@ -39,15 +39,15 @@ rf.killed(). You may want to do this in all loops, to avoid having dead Raft
 instances print confusing messages.
 
 Lab 2B
-- [ ] Your first goal should be to pass TestBasicAgree2B(). Start by
+- [X] Your first goal should be to pass TestBasicAgree2B(). Start by
 implementing Start(), then write the code to send and receive new log entries
 via AppendEntries RPCs, following Figure 2.
-- [ ] You will need to implement the election restriction (section 5.4.1).
-= [ ] One way to fail to reach agreement in the early Lab 2B tests is to hold
+- [X] You will need to implement the election restriction (section 5.4.1).
+= [X] One way to fail to reach agreement in the early Lab 2B tests is to hold
 repeated elections even though the leader is alive. Look for bugs in election
 timer management, or not sending out heartbeats immediately after winning an
 election.
-- [ ] Avoid loops that repeatedly check for evnets. Use conditional variable or
+- [X] Avoid loops that repeatedly check for evnets. Use conditional variable or
 sleeps to avoid such loops.
 */
 
@@ -149,7 +149,8 @@ type Raft struct {
 	electionTimerCheckInterval time.Duration
 	heartbeatCheckInterval     time.Duration
 
-	applyCh chan ApplyMsg
+	applyCh       chan ApplyMsg
+	notifyApplyCh chan bool
 }
 
 // return currentTerm and whether this server
@@ -451,7 +452,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	rf.convertToFollowerIfOutOfTerm(args.Term)
 
@@ -463,6 +463,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("    replies False: smaller term")
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		defer rf.mu.Unlock()
 		return
 	}
 
@@ -474,6 +475,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("    replies False: Non existing log entry")
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		defer rf.mu.Unlock()
 		return
 	}
 
@@ -512,12 +514,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	DPrintf("    Updated log: %v", rf.log)
 
+	notify := false
 	if args.LeaderCommit > rf.commitIndex {
 		// The 4-th point in the student guide "Incorrect RPC handlers".
 		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
 		rf.commitIndex = Min(args.LeaderCommit, lastNewEntryIndex)
-
+		notify = true
 		DPrintf("    (follower) updates commitIndex to %v", rf.commitIndex)
+	}
+
+	rf.mu.Unlock()
+	if notify {
+		DPrintf("[%v] tries to notify apply", rf.me)
+		rf.notifyApplyCh <- true
 	}
 }
 
@@ -610,9 +619,15 @@ func (rf *Raft) sendAppendEntriesToPeers() {
 					DPrintf("    Updated: nextIndex: %v, matchIndex: %v", rf.nextIndex[server], rf.matchIndex[server])
 
 					// Try to increment rf.commitIndex
+					oldCommitIndex := rf.commitIndex
 					rf.tryCommit()
+					newCommitIndex := rf.commitIndex
 
-					defer rf.mu.Unlock()
+					rf.mu.Unlock()
+					if oldCommitIndex < newCommitIndex {
+						DPrintf("[%v] tries to notify apply", rf.me)
+						rf.notifyApplyCh <- true
+					}
 					return
 				} else {
 					DPrintf("[%v] receives FAIL AppendEntries from [%v]", rf.me, server)
@@ -699,11 +714,15 @@ func (rf *Raft) convertToFollowerIfOutOfTerm(rpcTerm int) bool {
 func (rf *Raft) applyCommittedRoutine() {
 	// Later change this to use condition variable
 	for {
+		DPrintf("[%v] waiting to be notified", rf.me)
+		<-rf.notifyApplyCh
+		DPrintf("[%v] Notified to apply", rf.me)
+
 		toApply := false
 		var applyMsg ApplyMsg
 
 		rf.mu.Lock()
-		if rf.commitIndex > rf.lastApplied {
+		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
 			applyMsg = ApplyMsg{
 				CommandValid: true,
@@ -711,15 +730,15 @@ func (rf *Raft) applyCommittedRoutine() {
 				CommandIndex: rf.lastApplied,
 			}
 			toApply = true
+
+			rf.mu.Unlock()
+			if toApply {
+				DPrintf("[%v] sends %v on applyCh", rf.me, applyMsg.Command)
+				rf.applyCh <- applyMsg
+			}
+			rf.mu.Lock()
 		}
 		rf.mu.Unlock()
-
-		if toApply {
-			DPrintf("[%v] sends %v on applyCh", rf.me, applyMsg.Command)
-			rf.applyCh <- applyMsg
-		}
-
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -761,6 +780,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimerCheckInterval = 150 * time.Millisecond
 	rf.heartbeatCheckInterval = 50 * time.Millisecond
 	rf.applyCh = applyCh
+	rf.notifyApplyCh = make(chan bool)
 
 	// Leader only fields would be initialized later when elected
 

@@ -69,10 +69,12 @@ sleeps to avoid such loops.
 //
 
 import (
+	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
 
@@ -167,6 +169,7 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
+// YY: The caller should hold rf.mu throughout the call
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -176,11 +179,20 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.votedFor)
+	encoder.Encode(rf.log)
+	data := buffer.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
 // restore previously persisted state.
 //
+// YY: The caller should hold rf.mu throughout the call.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -198,6 +210,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	buffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buffer)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if decoder.Decode(&currentTerm) != nil ||
+		decoder.Decode(&votedFor) != nil ||
+		decoder.Decode(&log) != nil {
+		DPrintf("[%v] Fail to decode", rf.me)
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 //
@@ -226,6 +253,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Start the agreement process and return immediately
 	rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
+	rf.persist()
 	DPrintf("[%v] receives command %v from client, currentTerm = %v", rf.me, command, rf.currentTerm)
 	DPrintf("    %v", rf.log)
 	return len(rf.log) - 1, rf.currentTerm, true
@@ -336,6 +364,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		DPrintf("    votes for [%v] in term %v", args.CandidateID, rf.currentTerm)
 		rf.votedFor = args.CandidateID
 		reply.VoteGranted = true
+		rf.persist()
 
 		// Granting vote to candidate, reset timer
 		DPrintf("    resets election timer for granting vote")
@@ -359,6 +388,7 @@ func (rf *Raft) electionTimoutRoutine() {
 			rf.resetElectionTimer()
 			rf.votesReceived = 1
 			DPrintf("[%v] becomes candidate, rf.currentTerm = %v, %v", rf.me, rf.currentTerm, rf.log)
+			rf.persist()
 
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
@@ -512,6 +542,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = append(rf.log, args.Entries[i])
 		}
 	}
+	rf.persist()
 	DPrintf("    Updated log: %v", rf.log)
 
 	notify := false
@@ -650,6 +681,7 @@ func (rf *Raft) sendAppendEntriesToPeers() {
 				rf.mu.Unlock()
 
 				DPrintf("[%v]'s AppendEntries to [%v] fail due to log inconsistency, retry", rf.me, server)
+				// Sleep a while before retrying, to allow other threads run.
 				time.Sleep(10 * time.Millisecond)
 			}
 		}(i, args)
@@ -705,6 +737,7 @@ func (rf *Raft) convertToFollowerIfOutOfTerm(rpcTerm int) bool {
 		rf.currentTerm = rpcTerm
 		rf.votedFor = noPeer
 		rf.state = followerState
+		rf.persist()
 		return true
 	}
 

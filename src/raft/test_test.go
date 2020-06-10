@@ -8,12 +8,14 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -155,7 +157,9 @@ func TestFailAgree2B(t *testing.T) {
 
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
+	DPrintf("[TEST] current leader: [%v]", leader)
 	cfg.disconnect((leader + 1) % servers)
+	DPrintf("[TEST] [%v] disconnects", (leader+1)%servers)
 
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
@@ -167,6 +171,7 @@ func TestFailAgree2B(t *testing.T) {
 
 	// re-connect
 	cfg.connect((leader + 1) % servers)
+	DPrintf("[TEST] [%v] rejoins", (leader+1)%servers)
 
 	// the full set of servers should preserve
 	// previous agreements, and be able to agree
@@ -338,30 +343,41 @@ func TestRejoin2B(t *testing.T) {
 	cfg.begin("Test (2B): rejoin of partitioned leader")
 
 	cfg.one(101, servers, true)
+	DPrintf("[TEST] all servers commits 101")
 
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect(leader1)
+	DPrintf("[TEST] current leader [%v] disconnects #1", leader1)
+	DPrintf("[TEST] remaining servers: [%v], [%v]", (leader1+1)%servers, (leader1+2)%servers)
 
 	// make old leader try to agree on some entries
 	cfg.rafts[leader1].Start(102)
 	cfg.rafts[leader1].Start(103)
 	cfg.rafts[leader1].Start(104)
+	DPrintf("102, 103, 104 started on [%v]", leader1)
 
 	// new leader commits, also for index=2
 	cfg.one(103, 2, true)
+	DPrintf("[TEST] [%v], [%v] commits 103", (leader1+1)%servers, (leader1+2)%servers)
 
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
 	cfg.disconnect(leader2)
+	DPrintf("[TEST] current leader [%v] disconnects #2", leader2)
 
 	// old leader connected again
 	cfg.connect(leader1)
+	DPrintf("[TEST] [%v] rejoins #1", leader1)
 
 	cfg.one(104, 2, true)
+	DPrintf("[TEST] {[0], [1], [2]} \\ {[%v]} commits 104", leader2)
+	DPrintf("[TEST] leader1: [%v], leader2: [%v]", leader1, leader2)
 
 	// all together now
 	cfg.connect(leader2)
+	DPrintf("[TEST] [%v] rejoins #2", leader2)
+	DPrintf("[TEST] tries to commit {105}")
 
 	cfg.one(105, servers, true)
 

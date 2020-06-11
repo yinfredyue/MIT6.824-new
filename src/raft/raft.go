@@ -473,6 +473,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// Used by fast roll-back
+	XTerm  int // Term of conflicting entry in follower's log
+	XIndex int // Index of the first entry with XTerm in the follower's log
+	XLen   int // Length of follower's log
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -503,8 +508,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if len(rf.log) < args.PrevLogIndex+1 || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		DPrintf("    replies False: Non existing log entry")
+
+		/* Normal roll-back (no-leader) */
+		// reply.Term = rf.currentTerm
+		// reply.Success = false
+
+		/* Fast roll-back (no-leader) */
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.XIndex = -1
+		reply.XTerm = -1
+
+		if len(rf.log) >= args.PrevLogIndex+1 {
+			reply.XTerm = rf.log[args.PrevLogIndex].Term
+			for i := args.PrevLogIndex; i >= 1; i-- {
+				if rf.log[i].Term == reply.XTerm {
+					reply.XIndex = i
+				} else {
+					break
+				}
+			}
+		}
+		reply.XLen = len(rf.log)
+
 		defer rf.mu.Unlock()
 		return
 	}
@@ -512,6 +538,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	DPrintf("    replies True: log entry matches")
 	reply.Term = rf.currentTerm
 	reply.Success = true
+	reply.XIndex = -1
+	reply.XTerm = -1
+	reply.XLen = len(rf.log)
 
 	// Subtle: Read Figure 2 and student's guide carefully.
 	// Mentioned in "The importance of details" section of the student guide.
@@ -603,9 +632,14 @@ func (rf *Raft) sendAppendEntriesToPeers() {
 			LeaderID:     rf.me,
 			PrevLogIndex: rf.nextIndex[i] - 1, // TOOD
 			PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
-			Entries:      rf.log[rf.nextIndex[i]:],
 			LeaderCommit: rf.commitIndex,
 		}
+		if rf.nextIndex[i] <= len(rf.log) {
+			args.Entries = rf.log[rf.nextIndex[i]:]
+		} else {
+			args.Entries = []LogEntry{}
+		}
+
 		DPrintf("[%v] sends AppendEntries to [%v]", rf.me, i)
 		DPrintf("    %+v", args)
 		go func(server int, args AppendEntriesArgs) {
@@ -664,15 +698,57 @@ func (rf *Raft) sendAppendEntriesToPeers() {
 					DPrintf("[%v] receives FAIL AppendEntries from [%v]", rf.me, server)
 					DPrintf("    Original: nextIndex: %v, matchIndex: %v", rf.nextIndex[server], rf.matchIndex[server])
 
-					// AppendEntries fail due to log inconsistency: decrement
-					// nextIndex and retry
-					if rf.nextIndex[server] > 1 {
-						rf.nextIndex[server]--
+					/* Normal roll-back (leader) */
+					// Log inconsistency: decrement nextIndex and retry
+					// if rf.nextIndex[server] > 1 {
+					// 	rf.nextIndex[server]--
 
-						// Subtle: Don't forget to Update args
-						args.PrevLogIndex = rf.nextIndex[server] - 1
-						args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+					// 	// Subtle: Don't forget to Update args
+					// 	args.PrevLogIndex = rf.nextIndex[server] - 1
+					// 	args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+					// 	args.Entries = rf.log[rf.nextIndex[server]:]
+					// }
+
+					/* Fast roll-back (leader) */
+					// - Case 1: Leader's log doesn't contains entry of XTerm,
+					// nextIndex = XIndex;
+					// - Case 2: Leader's log has some entry of XTerm,
+					// nextIndex = Leader's last entry for XTerm
+					// - Case 3: No conflict, just missing entries.
+					// nextIndex = XLen
+
+					if reply.XTerm >= 0 {
+						lastXTermEntryIndex := -1
+						for i := len(rf.log) - 1; i >= 1; i-- {
+							if rf.log[i].Term == reply.XTerm {
+								lastXTermEntryIndex = i
+								break
+							}
+						}
+
+						if lastXTermEntryIndex < 0 {
+							// Case 1
+							rf.nextIndex[server] = Max(reply.XIndex, 1)
+						} else {
+							// Case 2
+							rf.nextIndex[server] = lastXTermEntryIndex
+						}
+
+					} else {
+						// Case 3
+						rf.nextIndex[server] = reply.XLen
+					}
+					if rf.nextIndex[server] < 1 {
+						DPrintf("PANIC < 1")
+					}
+
+					// Update args
+					args.PrevLogIndex = rf.nextIndex[server] - 1
+					args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+					if rf.nextIndex[server] < len(rf.log) {
 						args.Entries = rf.log[rf.nextIndex[server]:]
+					} else {
+						args.Entries = []LogEntry{}
 					}
 
 					DPrintf("    Updated: nextIndex: %v, matchIndex: %v", rf.nextIndex[server], rf.matchIndex[server])
@@ -815,7 +891,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.notifyApplyCh = make(chan bool)
 
-	// Leader only fields would be initialized later when elected
+	// Leader-only fields would be initialized later when elected
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

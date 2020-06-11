@@ -1,5 +1,55 @@
 package raft
 
+/* This raft.go passes all Lab2C tests except for Figure 8 (unreliable),
+probably because it doesn't use fast roll-back.
+
+$ time go test -run 2B
+Test (2B): basic agreement ...
+  ... Passed --   1.7  3   16    3904    3
+Test (2B): RPC byte count ...
+  ... Passed --   5.5  3   56  113586   11
+Test (2B): agreement despite follower disconnection ...
+  ... Passed --   7.6  3   88   19946    7
+Test (2B): no agreement if too many followers disconnect ...
+  ... Passed --   4.6  5  148   26482    3
+Test (2B): concurrent Start()s ...
+  ... Passed --   1.2  3   12    2756    6
+Test (2B): rejoin of partitioned leader ...
+  ... Passed --   8.9  3  137   29733    4
+Test (2B): leader backs up quickly over incorrect follower logs ...
+  ... Passed --  48.4  5 2402 1688692  103
+Test (2B): RPC counts aren't too high ...
+  ... Passed --   2.3  3   24    5988   12
+PASS
+ok      _/mnt/c/Users/yy0125/Desktop/6.824/src/raft     80.209s
+
+real    1m20.727s
+user    0m5.864s
+sys     0m7.728s
+
+$ go test -run 2C
+Test (2C): basic persistence ...
+  ... Passed --   6.7  3  218   39776    6
+Test (2C): more persistence ...
+  ... Passed --  32.5  5 3310  419742   16
+Test (2C): partitioned leader and one follower crash, leader restarts ...
+  ... Passed --   6.7  3  109   19701    4
+Test (2C): Figure 8 ...
+  ... Passed --  32.0  5 8345 1716291   12
+Test (2C): unreliable agreement ...
+  ... Passed --  17.3  5  430  115869  251
+Test (2C): Figure 8 (unreliable) ...
+--- FAIL: TestFigure8Unreliable2C (37.98s)
+    config.go:483: one(7576) failed to reach agreement
+Test (2C): churn ...
+  ... Passed --  16.5  5 1016  562038  120
+Test (2C): unreliable churn ...
+  ... Passed --  19.0  5  989  259507  121
+FAIL
+exit status 1
+FAIL    _/mnt/c/Users/yy0125/Desktop/6.824/src/raft     168.693s
+*/
+
 /*
 Lab 2A
 - [X] This Lab cares about: Sending/Receiving RequestVote RPCs, election-related
@@ -473,11 +523,6 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
-
-	// Used by fast roll-back
-	XTerm  int // Term of conflicting entry in follower's log
-	XIndex int // Index of the first entry with XTerm in the follower's log
-	XLen   int // Length of follower's log
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -510,26 +555,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("    replies False: Non existing log entry")
 
 		/* Normal roll-back (no-leader) */
-		// reply.Term = rf.currentTerm
-		// reply.Success = false
-
-		/* Fast roll-back (no-leader) */
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		reply.XIndex = -1
-		reply.XTerm = -1
-
-		if len(rf.log) >= args.PrevLogIndex+1 {
-			reply.XTerm = rf.log[args.PrevLogIndex].Term
-			for i := args.PrevLogIndex; i >= 1; i-- {
-				if rf.log[i].Term == reply.XTerm {
-					reply.XIndex = i
-				} else {
-					break
-				}
-			}
-		}
-		reply.XLen = len(rf.log)
 
 		defer rf.mu.Unlock()
 		return
@@ -538,9 +565,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	DPrintf("    replies True: log entry matches")
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	reply.XIndex = -1
-	reply.XTerm = -1
-	reply.XLen = len(rf.log)
 
 	// Subtle: Read Figure 2 and student's guide carefully.
 	// Mentioned in "The importance of details" section of the student guide.
@@ -632,134 +656,75 @@ func (rf *Raft) sendAppendEntriesToPeers() {
 			LeaderID:     rf.me,
 			PrevLogIndex: rf.nextIndex[i] - 1, // TOOD
 			PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
+			Entries:      rf.log[rf.nextIndex[i]:],
 			LeaderCommit: rf.commitIndex,
 		}
-		if rf.nextIndex[i] <= len(rf.log) {
-			args.Entries = rf.log[rf.nextIndex[i]:]
-		} else {
-			args.Entries = []LogEntry{}
-		}
-
 		DPrintf("[%v] sends AppendEntries to [%v]", rf.me, i)
 		DPrintf("    %+v", args)
 		go func(server int, args AppendEntriesArgs) {
 			// Figures 2: retry if AppendEntries fails due to log inconsistency:
 			// Thus, if the RPC receives no reply, we don't retry.
-			var ok bool
 
-			for {
-				reply := AppendEntriesReply{}
-				ok = rf.sendAppendEntries(server, &args, &reply)
-				if !ok {
-					DPrintf("[%v]'s AppendEntries to [%v] fails to receive a reply", rf.me, server)
-					return
-				}
+			reply := AppendEntriesReply{}
+			ok := rf.sendAppendEntries(server, &args, &reply)
+			if !ok {
+				DPrintf("[%v]'s AppendEntries to [%v] fails to receive a reply", rf.me, server)
+				return
+			}
 
-				// Receives a reply
-				rf.mu.Lock()
+			// Receives a reply
+			rf.mu.Lock()
 
-				// Quit if out of term
-				if rf.convertToFollowerIfOutOfTerm(reply.Term) {
-					DPrintf("[%v] is out of term, convert from leader to follower", rf.me)
-					defer rf.mu.Unlock()
-					return
-				}
+			// Quit if out of term
+			if rf.convertToFollowerIfOutOfTerm(reply.Term) {
+				DPrintf("[%v] is out of term, convert from leader to follower", rf.me)
+				defer rf.mu.Unlock()
+				return
+			}
 
-				// Quit if no longer leader
-				if rf.state != leaderState {
-					DPrintf("[%v] no longer a leader", rf.me)
-					defer rf.mu.Unlock()
-					return
-				}
+			// Quit if no longer leader
+			if rf.state != leaderState {
+				DPrintf("[%v] no longer a leader", rf.me)
+				defer rf.mu.Unlock()
+				return
+			}
 
-				if reply.Success {
-					DPrintf("[%v] receives SUCCESS AppendEntries from [%v]", rf.me, server)
-					DPrintf("    Original: nextIndex: %v, matchIndex: %v", rf.nextIndex[server], rf.matchIndex[server])
+			if reply.Success {
+				DPrintf("[%v] receives SUCCESS AppendEntries from [%v]", rf.me, server)
+				DPrintf("    Original: nextIndex: %v, matchIndex: %v", rf.nextIndex[server], rf.matchIndex[server])
 
-					// AppendEntries succeeded
-					// update nextIndex and matchIndex for the follower
-					rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-					rf.matchIndex[server] = Max(0, rf.nextIndex[server]-1)
+				// AppendEntries succeeded
+				// update nextIndex and matchIndex for the follower
+				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+				rf.matchIndex[server] = Max(0, rf.nextIndex[server]-1)
 
-					DPrintf("    Updated: nextIndex: %v, matchIndex: %v", rf.nextIndex[server], rf.matchIndex[server])
+				DPrintf("    Updated: nextIndex: %v, matchIndex: %v", rf.nextIndex[server], rf.matchIndex[server])
 
-					// Try to increment rf.commitIndex
-					oldCommitIndex := rf.commitIndex
-					rf.tryCommit()
-					newCommitIndex := rf.commitIndex
-
-					rf.mu.Unlock()
-					if oldCommitIndex < newCommitIndex {
-						DPrintf("[%v] tries to notify apply", rf.me)
-						rf.notifyApplyCh <- true
-					}
-					return
-				} else {
-					DPrintf("[%v] receives FAIL AppendEntries from [%v]", rf.me, server)
-					DPrintf("    Original: nextIndex: %v, matchIndex: %v", rf.nextIndex[server], rf.matchIndex[server])
-
-					/* Normal roll-back (leader) */
-					// Log inconsistency: decrement nextIndex and retry
-					// if rf.nextIndex[server] > 1 {
-					// 	rf.nextIndex[server]--
-
-					// 	// Subtle: Don't forget to Update args
-					// 	args.PrevLogIndex = rf.nextIndex[server] - 1
-					// 	args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-					// 	args.Entries = rf.log[rf.nextIndex[server]:]
-					// }
-
-					/* Fast roll-back (leader) */
-					// - Case 1: Leader's log doesn't contains entry of XTerm,
-					// nextIndex = XIndex;
-					// - Case 2: Leader's log has some entry of XTerm,
-					// nextIndex = Leader's last entry for XTerm
-					// - Case 3: No conflict, just missing entries.
-					// nextIndex = XLen
-
-					if reply.XTerm >= 0 {
-						lastXTermEntryIndex := -1
-						for i := len(rf.log) - 1; i >= 1; i-- {
-							if rf.log[i].Term == reply.XTerm {
-								lastXTermEntryIndex = i
-								break
-							}
-						}
-
-						if lastXTermEntryIndex < 0 {
-							// Case 1
-							rf.nextIndex[server] = Max(reply.XIndex, 1)
-						} else {
-							// Case 2
-							rf.nextIndex[server] = lastXTermEntryIndex
-						}
-
-					} else {
-						// Case 3
-						rf.nextIndex[server] = reply.XLen
-					}
-					if rf.nextIndex[server] < 1 {
-						DPrintf("PANIC < 1")
-					}
-
-					// Update args
-					args.PrevLogIndex = rf.nextIndex[server] - 1
-					args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-					if rf.nextIndex[server] < len(rf.log) {
-						args.Entries = rf.log[rf.nextIndex[server]:]
-					} else {
-						args.Entries = []LogEntry{}
-					}
-
-					DPrintf("    Updated: nextIndex: %v, matchIndex: %v", rf.nextIndex[server], rf.matchIndex[server])
-				}
+				// Try to increment rf.commitIndex
+				oldCommitIndex := rf.commitIndex
+				rf.tryCommit()
+				newCommitIndex := rf.commitIndex
 
 				rf.mu.Unlock()
+				if oldCommitIndex < newCommitIndex {
+					DPrintf("[%v] tries to notify apply", rf.me)
+					rf.notifyApplyCh <- true
+				}
+				return
+			} else {
+				DPrintf("[%v] receives FAIL AppendEntries from [%v]", rf.me, server)
+				DPrintf("    Original: nextIndex: %v, matchIndex: %v", rf.nextIndex[server], rf.matchIndex[server])
 
-				DPrintf("[%v]'s AppendEntries to [%v] fail due to log inconsistency, retry", rf.me, server)
-				// Sleep a while before retrying, to allow other threads run.
-				time.Sleep(10 * time.Millisecond)
+				/* Normal roll-back (leader) */
+				// Log inconsistency: decrement nextIndex and retry
+				if rf.nextIndex[server] > 1 {
+					rf.nextIndex[server]--
+				}
+
+				DPrintf("    Updated: nextIndex: %v, matchIndex: %v", rf.nextIndex[server], rf.matchIndex[server])
 			}
+
+			rf.mu.Unlock()
 		}(i, args)
 	}
 }
@@ -801,7 +766,7 @@ func (rf *Raft) tryCommit() {
 // election timeout. It requires the caller holding rf.mu throughout the call.
 func (rf *Raft) resetElectionTimer() {
 	rf.prevTime = time.Now()
-	rf.electionTimeout = time.Duration(RangeInt(500, 800)) * time.Millisecond
+	rf.electionTimeout = time.Duration(RangeInt(400, 500)) * time.Millisecond
 }
 
 // convertToFollowerIfOutOfTerm converst to follower if RPC request/response
@@ -813,6 +778,7 @@ func (rf *Raft) convertToFollowerIfOutOfTerm(rpcTerm int) bool {
 		rf.currentTerm = rpcTerm
 		rf.votedFor = noPeer
 		rf.state = followerState
+		rf.resetElectionTimer()
 		rf.persist()
 		return true
 	}
@@ -885,7 +851,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = followerState
 	rf.resetElectionTimer()
 	rf.votesReceived = 0
-	rf.heartbeatInterval = 200 * time.Millisecond
+	rf.heartbeatInterval = 100 * time.Millisecond
 	rf.electionTimerCheckInterval = 150 * time.Millisecond
 	rf.heartbeatCheckInterval = 50 * time.Millisecond
 	rf.applyCh = applyCh

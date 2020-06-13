@@ -38,4 +38,4 @@ Thoughts:
 
     So we are sending periodic `AppendEntries` essentially! Check `raft.go:periodicAppendEntriesRoutine()` and `raft.go:sendAppendEntriesToPeers()`.
 
-6. Fast backup is important to pass the test in 2B and 2C. If you implement it in 2B, 2C would not take too many efforts. The lecture notes explains the mechanism clearly, but there're can be subtle bugs during implementation.
+6. Fast backup is important to pass the test in 2B and 2C. If you implement it in 2B, 2C would not take too many efforts. The lecture notes explains the mechanism, but there can be subtle bugs during implementation. Eventually I borrowed code from somewhere else, instead of spending more time to fix the bug. Refer to `raft.go-slow`, `raft.go-fastBuggy` and `raft.go` for details.

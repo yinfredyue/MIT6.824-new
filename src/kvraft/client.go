@@ -1,13 +1,28 @@
 package kvraft
 
-import "../labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
 
+	"../labrpc"
+)
 
+// The client talks to the service through a Clerk with Put/Append/Get methods.
+// A Clert manages RPC connections with the servers.
+// Clerk sends Put(), Append(), and Get() RPCs to the kvservers whose assoicated
+// Raft is the leader. The kvserver code submits the operation to Raft. All the
+// kvservers exeucte operations from Raft log in order, applying them to the
+// key/value database. This guarantees identical replicas.
+// If the operation is committed, the leader reports the result to the Clerk
+// by responding to its RPC. Otherwise, the server reports an error, and the
+// Clerk retries.
+// So client (client.go) talks to server (server.go). The server talks with
+// the Raft instance (raft.go).
 type Clerk struct {
 	servers []*labrpc.ClientEnd
+
 	// You will have to modify this struct.
+	prevLeader int
 }
 
 func nrand() int64 {
@@ -37,9 +52,28 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+	for i := ck.prevLeader; ; i = (i + 1) % len(ck.servers) {
+		args := GetArgs{key}
+		reply := GetReply{}
+		ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
 
-	// You will have to modify this function.
-	return ""
+		if !ok {
+			DPrintf("Client cannot contact [Server %v]", i)
+			continue
+		}
+
+		// Received reply
+		switch reply.Err {
+		case OK:
+			ck.prevLeader = i
+			return reply.Value
+		case ErrNoKey:
+			ck.prevLeader = i
+			return ""
+		case ErrWrongLeader:
+			continue
+		}
+	}
 }
 
 //
@@ -54,6 +88,28 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	for i := ck.prevLeader; ; i = (i + 1) % len(ck.servers) {
+		args := PutAppendArgs{key, value, op}
+		reply := PutAppendReply{}
+		ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+
+		if !ok {
+			DPrintf("Client cannot contact [Server %v]", i)
+			continue
+		}
+
+		// Received reply
+		switch reply.Err {
+		case OK:
+			ck.prevLeader = i
+			return
+		case ErrNoKey:
+			DPrintf("Unexpected: PutAppend gets ErrNoKey")
+			return
+		case ErrWrongLeader:
+			continue
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

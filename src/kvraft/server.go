@@ -1,12 +1,13 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
 const Debug = 0
@@ -18,11 +19,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
+// Op would be passed as argument to rf.Start(). Thus, when receiving ApplyMsg,
+// the Op can be retrived by applyMsg.Command.
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key   string
+	Value string
+	OpID  int64
 }
 
 type KVServer struct {
@@ -35,15 +40,94 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-}
 
+	// ApplyMsg related
+	committedOps map[int64]Op
+	recvCond     *(sync.Cond)
+
+	// key-value database
+	db map[string]string
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// Start the consensus process on Raft
+	opID := nrand()
+	op := Op{
+		Key:  args.Key,
+		OpID: opID,
+	}
+	kv.rf.Start(op)
+
+	// Wait for the opreation to be committed
+	op, ok := kv.committedOps[opID]
+	for !ok {
+		kv.recvCond.Wait()
+		op, ok = kv.committedOps[opID]
+	}
+
+	// The Op is committed, op stores the Op
+	delete(kv.committedOps, opID)
+
+	// Apply the operation to the kv store
+	value, ok := kv.db[op.Key]
+	if !ok {
+		reply.Err = ErrNoKey
+		return
+	}
+
+	// value exists
+	reply.Err = OK
+	reply.Value = value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	opID := nrand()
+	op := Op{
+		Key:   args.Key,
+		Value: args.Value,
+		OpID:  opID,
+	}
+	kv.rf.Start(op)
+
+	op, ok := kv.committedOps[opID]
+	for !ok {
+		kv.recvCond.Wait()
+		op, ok = kv.committedOps[opID]
+	}
+
+	delete(kv.committedOps, opID)
+
+	if args.Op == "Put" {
+		kv.db[op.Key] = op.Value
+	} else {
+		if _, ok = kv.db[op.Key]; !ok {
+			kv.db[op.Key] = ""
+		}
+
+		kv.db[op.Key] += op.Value
+	}
+
+	reply.Err = OK
 }
 
 //
@@ -65,6 +149,21 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+// This goroutine reads ApplyMsg from kv.applyCh and store them in kv.msgs.
+func (kv *KVServer) readApplyChRoutine() {
+	for {
+		msg := <-kv.applyCh
+		op := msg.Command.(Op)
+
+		kv.mu.Lock()
+		kv.committedOps[op.OpID] = op
+		kv.recvCond.Broadcast()
+		kv.mu.Unlock()
+
+		DPrintf("[S %v] recieves %v from Raft intance", kv.me, msg)
+	}
 }
 
 //
@@ -96,6 +195,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.committedOps = make(map[int64]Op)
+	kv.recvCond = sync.NewCond(&kv.mu)
+	kv.db = make(map[string]string)
+
+	go kv.readApplyChRoutine()
 
 	return kv
 }

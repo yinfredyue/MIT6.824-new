@@ -61,7 +61,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	// Start the consensus process on Raft
-	opID := nrand()
+	opID := args.ID
 	op := Op{
 		Key:  args.Key,
 		OpID: opID,
@@ -101,7 +101,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	opID := nrand()
+	opID := args.ID
 	op := Op{
 		Key:   args.Key,
 		Value: args.Value,

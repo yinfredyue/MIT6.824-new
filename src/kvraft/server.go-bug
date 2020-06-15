@@ -4,19 +4,13 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"../labgob"
 	"../labrpc"
 	"../raft"
 )
 
-const (
-	Debug = 0
-
-	numChecks     = 3
-	checkInterval = 150 * time.Millisecond
-)
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -29,6 +23,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 // the Op can be retrived by applyMsg.Command.
 type Op struct {
 	// Your definitions here.
+	// For debug
 	OpType string
 
 	Key   string
@@ -54,6 +49,10 @@ type KVServer struct {
 
 	// Your definitions here.
 
+	// ApplyMsg related
+	committedOps map[int64]Op
+	recvCond     *(sync.Cond)
+
 	// key-value database
 	db map[string]string
 
@@ -72,6 +71,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
+	DPrintf("[%v] leader receives Get(%v)", kv.me, args.Key)
+
 	// Check for duplicate request
 	if record, duplicate := kv.execRecord[args.ID]; duplicate {
 		reply.Err = record.Err
@@ -88,29 +89,40 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	kv.rf.Start(op)
 
-	// Wait for the opreation to be committed and applied
-	for i := 0; i < numChecks; i++ {
-		kv.mu.Unlock()
-		time.Sleep(checkInterval)
-		kv.mu.Lock()
-
-		// Evicted, retry
-		term2, _ := kv.rf.GetState()
-		if term2 != term1 {
+	// Wait for the opreation to be committed
+	op, ok := kv.committedOps[opID]
+	for !ok {
+		DPrintf("[%v] sleep for Get(%v), %v", kv.me, args.Key, args.ID)
+		kv.recvCond.Wait()
+		// The check for outdated leader (evicted leader) should be done after
+		// each wakeup, instead of after the for loop.
+		// Reason: In test_test.go:TestOnePartition3A, Put(1, 15) is issued
+		// initially on minority parition. If the check is not done after each
+		// wakeup, the server code would be stuck in this for loop. The client
+		// would resend the request the new leader, only after the evicted
+		// leader (orginal leader in the minority) replies.
+		if term2, isLeader := kv.rf.GetState(); term2 != term1 || !isLeader {
+			DPrintf("[%v] wakes up from Get(%v), %v, evicted!!!", kv.me, args.Key, args.ID)
 			reply.Err = ErrWrongLeader
 			return
 		}
-
-		record, ok := kv.execRecord[opID]
-		if ok {
-			reply.Err = record.Err
-			reply.Value = record.Value
-			return
-		}
+		op, ok = kv.committedOps[opID]
+		DPrintf("[%v] wakes up from Get(%v), %v", kv.me, args.Key, args.ID)
 	}
 
-	// Not commited/applied, make client retry
-	reply.Err = ErrWrongLeader
+	// The Op is committed, op stores the Op
+	delete(kv.committedOps, opID)
+
+	// Apply the operation to the kv store
+	value, ok := kv.db[op.Key]
+	if !ok {
+		reply.Err = ErrNoKey
+	} else {
+		reply.Err = OK
+		reply.Value = value
+	}
+
+	kv.execRecord[opID] = Record{reply.Err, reply.Value}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -123,6 +135,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
+
+	DPrintf("[%v] leader receives %v(%v, %v)", kv.me, args.Op, args.Key, args.Value)
 
 	// Check for duplicate request
 	if record, duplicate := kv.execRecord[args.ID]; duplicate {
@@ -139,28 +153,35 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	kv.rf.Start(op)
 
-	// Wait for the opreation to be committed and applied
-	for i := 0; i < numChecks; i++ {
-		kv.mu.Unlock()
-		time.Sleep(checkInterval)
-		kv.mu.Lock()
-
-		// Evicted, retry
-		term2, _ := kv.rf.GetState()
-		if term2 != term1 {
+	op, ok := kv.committedOps[opID]
+	for !ok {
+		DPrintf("[%v] sleeps for %v(%v, %v), %v", kv.me, args.Op, args.Key, args.Value, args.ID)
+		kv.recvCond.Wait()
+		// Check for evicted leader. For detail, read comment in Get().
+		if term2, isLeader := kv.rf.GetState(); term2 != term1 || !isLeader {
 			reply.Err = ErrWrongLeader
+			DPrintf("[%v] wakes from %v(%v, %v), evictted!!!", kv.me, args.Op, args.Key, args.Value)
 			return
 		}
-
-		record, ok := kv.execRecord[opID]
-		if ok {
-			reply.Err = record.Err
-			return
-		}
+		op, ok = kv.committedOps[opID]
+		DPrintf("[%v] wakes from %v(%v, %v), %v", kv.me, args.Op, args.Key, args.Value, args.ID)
 	}
 
-	// Not commited/applied, make client retry
-	reply.Err = ErrWrongLeader
+	delete(kv.committedOps, opID)
+
+	if args.Op == "Put" {
+		kv.db[op.Key] = op.Value
+	} else {
+		if _, ok = kv.db[op.Key]; !ok {
+			kv.db[op.Key] = ""
+		}
+
+		kv.db[op.Key] += op.Value
+	}
+
+	reply.Err = OK
+
+	kv.execRecord[opID] = Record{reply.Err, "Dummy"}
 }
 
 //
@@ -191,31 +212,8 @@ func (kv *KVServer) readApplyChRoutine() {
 		op := msg.Command.(Op)
 
 		kv.mu.Lock()
-
-		// Apply Op, if not duplicate
-		if _, duplicate := kv.execRecord[op.OpID]; !duplicate {
-			switch op.OpType {
-			case "Get":
-				value, ok := kv.db[op.Key]
-				if !ok {
-					kv.execRecord[op.OpID] = Record{ErrNoKey, ""}
-				} else {
-					kv.execRecord[op.OpID] = Record{OK, value}
-				}
-			case "Put":
-				kv.db[op.Key] = op.Value
-				kv.execRecord[op.OpID] = Record{OK, ""}
-			case "Append":
-				if _, ok := kv.db[op.Key]; !ok {
-					kv.db[op.Key] = ""
-				}
-				kv.db[op.Key] += op.Value
-				kv.execRecord[op.OpID] = Record{OK, ""}
-			default:
-				DPrintf("Panic: Unexpected")
-			}
-		}
-
+		kv.committedOps[op.OpID] = op
+		kv.recvCond.Broadcast()
 		kv.mu.Unlock()
 
 		DPrintf("[%v] recieves %+v from Raft instance", kv.me, op)
@@ -251,6 +249,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.committedOps = make(map[int64]Op)
+	kv.recvCond = sync.NewCond(&kv.mu)
 	kv.db = make(map[string]string)
 	kv.execRecord = make(map[int64]Record)
 

@@ -30,6 +30,13 @@ type Op struct {
 	OpID  int64
 }
 
+type Record struct {
+	Err Err
+
+	// Only used by Get
+	Value string
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -47,6 +54,9 @@ type KVServer struct {
 
 	// key-value database
 	db map[string]string
+
+	// execution history to handle duplicate requests
+	execRecord map[int64]Record
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -54,9 +64,18 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	_, isLeader := kv.rf.GetState()
+	term1, isLeader := kv.rf.GetState()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		return
+	}
+
+	DPrintf("[%v] leader receives Get(%v)", kv.me, args.Key)
+
+	// Check for duplicate request
+	if record, duplicate := kv.execRecord[args.ID]; duplicate {
+		reply.Err = record.Err
+		reply.Value = record.Value
 		return
 	}
 
@@ -72,6 +91,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	op, ok := kv.committedOps[opID]
 	for !ok {
 		kv.recvCond.Wait()
+		// The check for outdated leader (evicted leader) should be done after
+		// each wakeup, instead of after the for loop.
+		// Reason: In test_test.go:TestOnePartition3A, Put(1, 15) is issued
+		// initially on minority parition. If the check is not done after each
+		// wakeup, the server code would be stuck in this for loop. The client
+		// would resend the request the new leader, only after the evicted
+		// leader (orginal leader in the minority) replies.
+		if term2, _ := kv.rf.GetState(); term2 != term1 {
+			reply.Err = ErrWrongLeader
+			return
+		}
 		op, ok = kv.committedOps[opID]
 	}
 
@@ -82,12 +112,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	value, ok := kv.db[op.Key]
 	if !ok {
 		reply.Err = ErrNoKey
-		return
+	} else {
+		reply.Err = OK
+		reply.Value = value
 	}
 
-	// value exists
-	reply.Err = OK
-	reply.Value = value
+	kv.execRecord[opID] = Record{reply.Err, reply.Value}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -95,9 +125,17 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	_, isLeader := kv.rf.GetState()
+	term1, isLeader := kv.rf.GetState()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		return
+	}
+
+	DPrintf("[%v] leader receives %v(%v, %v)", kv.me, args.Op, args.Key, args.Value)
+
+	// Check for duplicate request
+	if record, duplicate := kv.execRecord[args.ID]; duplicate {
+		reply.Err = record.Err
 		return
 	}
 
@@ -112,6 +150,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	op, ok := kv.committedOps[opID]
 	for !ok {
 		kv.recvCond.Wait()
+		// Check for evicted leader. For detail, read comment in Get().
+		if term2, _ := kv.rf.GetState(); term2 != term1 {
+			reply.Err = ErrWrongLeader
+			return
+		}
 		op, ok = kv.committedOps[opID]
 	}
 
@@ -128,6 +171,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	reply.Err = OK
+
+	kv.execRecord[opID] = Record{reply.Err, "Dummy"}
 }
 
 //
@@ -162,7 +207,7 @@ func (kv *KVServer) readApplyChRoutine() {
 		kv.recvCond.Broadcast()
 		kv.mu.Unlock()
 
-		DPrintf("[S %v] recieves %v from Raft intance", kv.me, msg)
+		DPrintf("[%v] recieves %v from Raft instance", kv.me, op)
 	}
 }
 
@@ -198,6 +243,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.committedOps = make(map[int64]Op)
 	kv.recvCond = sync.NewCond(&kv.mu)
 	kv.db = make(map[string]string)
+	kv.execRecord = make(map[int64]Record)
 
 	go kv.readApplyChRoutine()
 

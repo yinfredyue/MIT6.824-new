@@ -1,17 +1,20 @@
 package kvraft
 
-import "../porcupine"
-import "../models"
-import "testing"
-import "strconv"
-import "time"
-import "math/rand"
-import "log"
-import "strings"
-import "sync"
-import "sync/atomic"
-import "fmt"
-import "io/ioutil"
+import (
+	"fmt"
+	"io/ioutil"
+	"log"
+	"math/rand"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"../models"
+	"../porcupine"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -499,12 +502,19 @@ func TestOnePartition3A(t *testing.T) {
 	const nservers = 5
 	cfg := make_config(t, nservers, false, -1)
 	defer cfg.cleanup()
+
+	// ck can connect with all other servers
 	ck := cfg.makeClient(cfg.All())
 
+	DPrintf("[TEST] Put(1, 13) issued")
 	Put(cfg, ck, "1", "13")
 
 	cfg.begin("Test: progress in majority (3A)")
 
+	// Create a partition, the current leader is in the minority
+	// cfg.partition sets up the connection to match the paritition.
+	// p1, p2: []int, p1 is majority, p2 is minority
+	// The current leader is in p2
 	p1, p2 := cfg.make_partition()
 	cfg.partition(p1, p2)
 
@@ -512,6 +522,7 @@ func TestOnePartition3A(t *testing.T) {
 	ckp2a := cfg.makeClient(p2) // connect ckp2a to p2
 	ckp2b := cfg.makeClient(p2) // connect ckp2b to p2
 
+	DPrintf("[TEST] Put(1, 14) in majority")
 	Put(cfg, ckp1, "1", "14")
 	check(cfg, t, ckp1, "1", "14")
 
@@ -522,11 +533,15 @@ func TestOnePartition3A(t *testing.T) {
 
 	cfg.begin("Test: no progress in minority (3A)")
 	go func() {
+		DPrintf("[TEST] Put(1, 15) in minority")
 		Put(cfg, ckp2a, "1", "15")
+		DPrintf("[TEST] Put(1, 15) returns")
 		done0 <- true
 	}()
 	go func() {
+		DPrintf("[TEST] Get(1) in minority")
 		Get(cfg, ckp2b, "1") // different clerk in p2
+		DPrintf("[TEST] Get(1) returns")
 		done1 <- true
 	}()
 
@@ -540,6 +555,7 @@ func TestOnePartition3A(t *testing.T) {
 
 	check(cfg, t, ckp1, "1", "14")
 	Put(cfg, ckp1, "1", "16")
+	DPrintf("[TEST] Put(1, 16) in majority")
 	check(cfg, t, ckp1, "1", "16")
 
 	cfg.end()

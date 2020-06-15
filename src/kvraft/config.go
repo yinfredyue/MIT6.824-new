@@ -352,6 +352,8 @@ func (cfg *config) make_partition() ([]int, []int) {
 		}
 	}
 	p2[len(p2)-1] = l
+	// The leader is in the minority, p2
+	// Thus, p1 is majority, p2 is minority
 	return p1, p2
 }
 

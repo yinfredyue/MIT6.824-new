@@ -52,25 +52,29 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+	DPrintf("Clerk tries to contact server, Get(%v)", key)
+	ID := nrand()
 	for i := ck.prevLeader; ; i = (i + 1) % len(ck.servers) {
-		args := GetArgs{key, nrand()}
+		args := GetArgs{key, ID}
 		reply := GetReply{}
 		ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
 
 		if !ok {
-			DPrintf("Client cannot contact [Server %v]", i)
 			continue
 		}
 
 		// Received reply
 		switch reply.Err {
 		case OK:
+			DPrintf("Server returns OK for Get(%v)", key)
 			ck.prevLeader = i
 			return reply.Value
 		case ErrNoKey:
+			DPrintf("Server returns NoKey for Get(%v)", key)
 			ck.prevLeader = i
 			return ""
 		case ErrWrongLeader:
+			DPrintf("Tries another server for Get(%v)", key)
 			continue
 		}
 	}
@@ -88,25 +92,28 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	DPrintf("Clerk tries to contact server, %v(%v, %v)", op, key, value)
+	ID := nrand()
 	for i := ck.prevLeader; ; i = (i + 1) % len(ck.servers) {
-		args := PutAppendArgs{key, value, op, nrand()}
+		args := PutAppendArgs{key, value, op, ID}
 		reply := PutAppendReply{}
 		ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
 
 		if !ok {
-			DPrintf("Client cannot contact [Server %v]", i)
 			continue
 		}
 
 		// Received reply
 		switch reply.Err {
 		case OK:
+			DPrintf("Server returns OK for %v(%v, %v)", op, key, value)
 			ck.prevLeader = i
 			return
 		case ErrNoKey:
-			DPrintf("Unexpected: PutAppend gets ErrNoKey")
+			DPrintf("Server returns NoKey for %v(%v, %v)", op, key, value)
 			return
 		case ErrWrongLeader:
+			DPrintf("Try another server for %v(%v, %v)", op, key, value)
 			continue
 		}
 	}
